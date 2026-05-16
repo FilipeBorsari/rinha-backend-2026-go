@@ -1,0 +1,37 @@
+
+# Local / runtime
+data-generator/generate
+resources/references.json
+.env
+test/results.json
+temporary-results
+
+# Binários
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+__debug_bin
+
+# Build local
+/bin/
+/dist/
+
+# Go
+bin/
+*.exe
+*.test
+*.out
+
+# Dataset files
+resources/references.json.gz
+resources/references.bin
+
+# Docker volumes
+data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
