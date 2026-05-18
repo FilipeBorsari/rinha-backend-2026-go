@@ -9,6 +9,7 @@ const (
 
 type KNNResult struct {
 	FraudScore float32
+	FraudCount int
 	Approved   bool
 }
 
@@ -61,6 +62,7 @@ func (s *VectorStore) Search(query [Dims]float32) KNNResult {
 	score := float32(fraudCount) / float32(kNeighbors)
 	return KNNResult{
 		FraudScore: score,
+		FraudCount: fraudCount,
 		Approved:   score < fraudThreshold,
 	}
 }
@@ -116,10 +118,11 @@ func updateTopK(
 }
 
 func squaredDist(q [Dims]uint8, ref []uint8, threshold uint32) uint32 {
+	rr := (*[Dims]uint8)(ref)
 	var sum uint32
 	for j := 0; j < Dims; j++ {
 		qj := q[j]
-		rj := ref[j]
+		rj := rr[j]
 		if qj == SentinelU8 || rj == SentinelU8 {
 			continue
 		}
