@@ -28,6 +28,9 @@ bin/
 resources/references.json.gz
 resources/references.bin
 
+#docs da rinha
+docs/br
+
 # Docker volumes
 data/
 
