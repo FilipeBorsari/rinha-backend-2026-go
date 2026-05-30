@@ -34,6 +34,9 @@ docs/br
 # Docker volumes
 data/
 
+# Go vendor
+vendor/
+
 # IDE
 .idea/
 .vscode/
