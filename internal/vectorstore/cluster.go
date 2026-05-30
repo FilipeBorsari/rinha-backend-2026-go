@@ -1,298 +1,258 @@
 package vectorstore
 
 import (
-	"math/rand/v2"
+	"fmt"
+	"math/rand"
+	"runtime"
 	"sync"
 )
 
-const (
-	// kSubClusters is the number of K-Means sub-clusters per binary partition.
-	// 64 clusters × 8 partitions = 512 total clusters.
-	// Each cluster holds ~375k/64 ≈ 5859 vectors on a 3M dataset.
-	kSubClusters = 64
+func (s *VectorStore) buildIndex() {
+	n := s.n
+	data := s.data
 
-	// kSearchClusters is how many sub-clusters we probe per partition during search.
-	// 6/64 = 9.4% of each partition → ~35k candidates per query (≈10x reduction).
-	kSearchClusters = 6
+	fmt.Printf("vectorstore: building L1 index (%d centroids) over %d records\n", L1Count, n)
 
-	// kmeansIters is the number of mini-batch K-Means iterations.
-	kmeansIters = 20
+	rng := rand.New(rand.NewSource(42))
 
-	// kmeansBatch is the number of random samples per mini-batch iteration.
-	kmeansBatch = 20_000
-)
+	l1Float := kmeansMiniBatch(data, n, L1Count, 5000, 15, rng)
+	l1Quant := quantizeCentroids(l1Float)
 
-// subCluster holds a quantized centroid and its vector range in the flat data array.
-type subCluster struct {
-	centroid [Dims]uint8
-	start    int32 // absolute index into VectorStore.data / .labels
-	size     int32 // number of vectors in this cluster
-}
+	l1Assign := make([]int32, n)
+	nw := runtime.NumCPU()
+	if nw > 8 {
+		nw = 8
+	}
+	assignParallel(data, n, l1Quant, l1Assign, nw)
+	l1Groups := groupByCluster(l1Assign, n, L1Count)
 
-// buildAllClusters builds sub-clusters for all 8 partitions in parallel.
-// Must be called after buildPartitions (data/labels already sorted by partition key).
-func buildAllClusters(data []uint8, labels []bool, partStart [9]int32) [8][]subCluster {
-	var result [8][]subCluster
+	fmt.Printf("vectorstore: building L2 index (%d sub-clusters/L1) in parallel\n", L2PerL1)
+
+	type l2Result struct {
+		centroids [][Dims]uint8
+		assign    []int32
+	}
+	l2Results := make([]l2Result, L1Count)
+
+	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 
-	for pk := 0; pk < 8; pk++ {
+	for l1i, group := range l1Groups {
 		wg.Add(1)
-		go func(pk int) {
-			defer wg.Done()
-			pStart := int(partStart[pk])
-			pEnd := int(partStart[pk+1])
-			// Each goroutine writes to its own non-overlapping slice of data/labels,
-			// so no mutex is needed.
-			result[pk] = buildPartitionClusters(data, labels, pStart, pEnd, int64(pk*31337+17))
-		}(pk)
-	}
+		sem <- struct{}{}
+		go func(l1i int, group []int) {
+			defer func() { <-sem; wg.Done() }()
 
+			rng2 := rand.New(rand.NewSource(int64(l1i) * 1_000_003))
+			gn := len(group)
+
+			subData := make([]uint8, gn*Dims)
+			for li, ri := range group {
+				copy(subData[li*Dims:li*Dims+Dims], data[ri*Dims:ri*Dims+Dims])
+			}
+
+			k := L2PerL1
+			if gn < k {
+				k = gn
+			}
+			l2Float := kmeansMiniBatch(subData, gn, k, 2000, 10, rng2)
+			// Pad to L2PerL1 with zero centroids if the group was too small.
+			for len(l2Float) < L2PerL1 {
+				l2Float = append(l2Float, [Dims]float32{})
+			}
+			l2Quant := quantizeCentroids(l2Float)
+
+			assign := make([]int32, gn)
+			for li := 0; li < gn; li++ {
+				assign[li] = int32(nearestQuantCentroid(subData[li*Dims:li*Dims+Dims], l2Quant))
+			}
+
+			l2Results[l1i] = l2Result{centroids: l2Quant, assign: assign}
+		}(l1i, group)
+	}
 	wg.Wait()
-	return result
-}
 
-// buildPartitionClusters runs mini-batch K-Means on the partition [pStart, pEnd),
-// reorders data/labels in-place by cluster assignment, and returns the descriptors.
-func buildPartitionClusters(data []uint8, labels []bool, pStart, pEnd int, seed int64) []subCluster {
-	n := pEnd - pStart
-	if n == 0 {
-		return nil
-	}
+	fmt.Println("vectorstore: reordering records by cluster...")
 
-	k := kSubClusters
-	if k > n {
-		k = n
-	}
-	if k == 1 {
-		// Trivial: single cluster, no reorder needed.
-		var c subCluster
-		c.start = int32(pStart)
-		c.size = int32(n)
-		c.centroid = centroidOfRange(data, pStart, pEnd)
-		return []subCluster{c}
-	}
+	s.l1s = make([]L1Cluster, L1Count)
+	newOrder := make([]int, 0, n)
 
-	rng := rand.New(rand.NewPCG(uint64(seed), uint64(n)))
+	for l1i, group := range l1Groups {
+		copy(s.l1s[l1i].centroid[:], l1Quant[l1i][:])
 
-	// --- Random initialisation (Forgy): pick k distinct random vectors ---
-	perm := rng.Perm(n)
-	centroids := make([][Dims]float32, k)
-	for i := 0; i < k; i++ {
-		off := (pStart + perm[i]) * Dims
-		for d := 0; d < Dims; d++ {
-			centroids[i][d] = float32(data[off+d])
-		}
-	}
+		res := l2Results[l1i]
+		l2Groups := groupByCluster(res.assign, len(group), L2PerL1)
 
-	// --- Mini-batch K-Means ---
-	for iter := 0; iter < kmeansIters; iter++ {
-		batchSize := kmeansBatch
-		if batchSize > n {
-			batchSize = n
-		}
-		batch := rng.Perm(n)[:batchSize]
-
-		counts := make([]int32, k)
-		sums := make([][Dims]float64, k)
-
-		for _, idx := range batch {
-			off := (pStart + idx) * Dims
-			c := nearestCentroidIdx(data[off:off+Dims], centroids)
-			counts[c]++
-			for d := 0; d < Dims; d++ {
-				sums[c][d] += float64(data[off+d])
+		for l2i := 0; l2i < L2PerL1; l2i++ {
+			start := int32(len(newOrder))
+			for _, li := range l2Groups[l2i] {
+				newOrder = append(newOrder, group[li])
 			}
+			copy(s.l1s[l1i].l2s[l2i].centroid[:], res.centroids[l2i][:])
+			s.l1s[l1i].l2s[l2i].start = start
+			s.l1s[l1i].l2s[l2i].length = int32(len(newOrder)) - start
 		}
-
-		// Update centroids; re-init empty ones with a random batch point.
-		for c := 0; c < k; c++ {
-			if counts[c] == 0 {
-				// Re-init with a random point from the batch.
-				idx := batch[rng.IntN(batchSize)]
-				off := (pStart + idx) * Dims
-				for d := 0; d < Dims; d++ {
-					centroids[c][d] = float32(data[off+d])
-				}
-				continue
-			}
-			fc := float64(counts[c])
-			for d := 0; d < Dims; d++ {
-				centroids[c][d] = float32(sums[c][d] / fc)
-			}
-		}
-	}
-
-	// --- Final full-partition assignment pass ---
-	assignments := make([]int32, n)
-	counts := make([]int32, k)
-	for i := 0; i < n; i++ {
-		off := (pStart + i) * Dims
-		c := nearestCentroidIdx(data[off:off+Dims], centroids)
-		assignments[i] = int32(c)
-		counts[c]++
-	}
-
-	// --- Build subCluster descriptors with absolute start offsets ---
-	clusters := make([]subCluster, k)
-	var cum int32 = int32(pStart)
-	for c := 0; c < k; c++ {
-		quantizeCentroid(&clusters[c].centroid, centroids[c])
-		clusters[c].start = cum
-		clusters[c].size = counts[c]
-		cum += counts[c]
-	}
-
-	// --- Reorder data/labels within the partition by cluster assignment ---
-	reorderPartitionByCluster(data, labels, pStart, n, assignments, counts, k)
-
-	return clusters
-}
-
-// nearestCentroidIdx returns the index of the nearest float32 centroid for vec.
-// Uses per-centroid early exit once current distance exceeds best.
-func nearestCentroidIdx(vec []uint8, centroids [][Dims]float32) int {
-	best := 0
-	bestDist := float32(1e38)
-	for c := range centroids {
-		var d float32
-		for i := 0; i < Dims; i++ {
-			diff := float32(vec[i]) - centroids[c][i]
-			d += diff * diff
-			if d >= bestDist {
-				goto nextCentroid
-			}
-		}
-		if d < bestDist {
-			bestDist = d
-			best = c
-		}
-	nextCentroid:
-	}
-	return best
-}
-
-func quantizeCentroid(dst *[Dims]uint8, src [Dims]float32) {
-	for d := 0; d < Dims; d++ {
-		v := src[d]
-		if v <= 0 {
-			dst[d] = 0
-		} else if v >= 255 {
-			dst[d] = 255
-		} else {
-			dst[d] = uint8(v)
-		}
-	}
-}
-
-func centroidOfRange(data []uint8, pStart, pEnd int) [Dims]uint8 {
-	var c [Dims]uint8
-	if pStart < pEnd {
-		off := pStart * Dims
-		copy(c[:], data[off:off+Dims])
-	}
-	return c
-}
-
-// reorderPartitionByCluster reorders data and labels within the partition [pStart, pStart+n)
-// so that all vectors belonging to the same cluster are contiguous.
-// assignments[i] is the cluster index for vector at position pStart+i.
-// counts[c] is the number of vectors in cluster c.
-// After reordering, cluster c occupies positions [sum(counts[:c]), sum(counts[:c+1])) relative to pStart.
-func reorderPartitionByCluster(data []uint8, labels []bool, pStart, n int, assignments []int32, counts []int32, k int) {
-	// Compute output start offsets per cluster (relative to partition start).
-	starts := make([]int32, k)
-	var cum int32
-	for c := 0; c < k; c++ {
-		starts[c] = cum
-		cum += counts[c]
 	}
 
 	newData := make([]uint8, n*Dims)
 	newLabels := make([]bool, n)
-	cursors := make([]int32, k)
-	copy(cursors, starts)
-
-	for i := 0; i < n; i++ {
-		c := assignments[i]
-		pos := int(cursors[c])
-		srcOff := (pStart + i) * Dims
-		copy(newData[pos*Dims:(pos+1)*Dims], data[srcOff:srcOff+Dims])
-		newLabels[pos] = labels[pStart+i]
-		cursors[c]++
+	for newIdx, oldIdx := range newOrder {
+		copy(newData[newIdx*Dims:newIdx*Dims+Dims], data[oldIdx*Dims:oldIdx*Dims+Dims])
+		newLabels[newIdx] = s.labels[oldIdx]
 	}
+	s.data = newData
+	s.labels = newLabels
 
-	copy(data[pStart*Dims:(pStart+n)*Dims], newData)
-	copy(labels[pStart:pStart+n], newLabels)
+	fmt.Printf("vectorstore: index ready — %d L1 × %d L2 = %d clusters\n",
+		L1Count, L2PerL1, L1Count*L2PerL1)
 }
 
-// centroidDist computes integer squared distance from query to a quantized centroid.
-// Dimensions where the query has SentinelU8 (missing) are skipped.
-func centroidDist(q, c [Dims]uint8) uint32 {
-	var sum uint32
-	for d := 0; d < Dims; d++ {
-		qd := q[d]
-		if qd == SentinelU8 {
-			continue
-		}
-		diff := int32(qd) - int32(c[d])
-		sum += uint32(diff * diff)
-	}
-	return sum
-}
-
-// findTopClusters returns the indices of the kSearchClusters nearest clusters.
-// Uses a linear scan over all clusters (at most kSubClusters=64, fits in L1 cache).
-func findTopClusters(q [Dims]uint8, clusters []subCluster) [kSearchClusters]int {
-	var topIdx [kSearchClusters]int
-	var topDist [kSearchClusters]uint32
-
-	n := kSearchClusters
-	if n > len(clusters) {
-		n = len(clusters)
+func kmeansMiniBatch(data []uint8, n, k, batchSize, iters int, rng *rand.Rand) [][Dims]float32 {
+	centroids := make([][Dims]float32, k)
+	if n == 0 {
+		return centroids
 	}
 
-	filled := 0
-	worstIdx := 0
-	worstDist := uint32(0)
+	actual := k
+	if n < k {
+		actual = n
+	}
 
-	for i := range clusters {
-		d := centroidDist(q, clusters[i].centroid)
-		if filled < n {
-			topIdx[filled] = i
-			topDist[filled] = d
-			filled++
-			if filled == n {
-				worstIdx, worstDist = findWorst(topDist[:n])
+	perm := rng.Perm(n)
+	for ci := 0; ci < actual; ci++ {
+		ri := perm[ci]
+		off := ri * Dims
+		for d := 0; d < Dims; d++ {
+			if data[off+d] == SentinelU8 {
+				centroids[ci][d] = -1
+			} else {
+				centroids[ci][d] = float32(data[off+d]) / quantScale
 			}
-		} else if d < worstDist {
-			topIdx[worstIdx] = i
-			topDist[worstIdx] = d
-			worstIdx, worstDist = findWorst(topDist[:n])
 		}
 	}
 
-	for i := filled; i < kSearchClusters; i++ {
-		topIdx[i] = -1
+	bs := batchSize
+	if bs > n {
+		bs = n
 	}
+	counts := make([]int, k)
 
-	for i := 1; i < filled; i++ {
-		for j := i; j > 0 && topDist[j] < topDist[j-1]; j-- {
-			topDist[j], topDist[j-1] = topDist[j-1], topDist[j]
-			topIdx[j], topIdx[j-1] = topIdx[j-1], topIdx[j]
+	for iter := 0; iter < iters; iter++ {
+		for s := 0; s < bs; s++ {
+			ri := rng.Intn(n)
+			off := ri * Dims
+			c := nearestFloat32Centroid(data[off:off+Dims], centroids[:actual])
+			counts[c]++
+			lr := float32(1.0) / float32(counts[c])
+			for d := 0; d < Dims; d++ {
+				if data[off+d] == SentinelU8 {
+					continue
+				}
+				v := float32(data[off+d]) / quantScale
+				if centroids[c][d] < 0 {
+					centroids[c][d] = v
+				} else {
+					centroids[c][d] += lr * (v - centroids[c][d])
+				}
+			}
 		}
 	}
 
-	return topIdx
+	return centroids
 }
 
-func findWorst(a []uint32) (int, uint32) {
-	idx := 0
-	worst := a[0]
-	for i := 1; i < len(a); i++ {
-		if a[i] > worst {
-			worst = a[i]
-			idx = i
+func nearestFloat32Centroid(vec []uint8, centroids [][Dims]float32) int {
+	best := 0
+	var bestDist float32 = 1e18
+	for ci, c := range centroids {
+		var dist float32
+		for d := 0; d < Dims; d++ {
+			if vec[d] == SentinelU8 || c[d] < 0 {
+				continue
+			}
+			diff := float32(vec[d])/quantScale - c[d]
+			if diff < 0 {
+				diff = -diff
+			}
+			dist += diff
+		}
+		if dist < bestDist {
+			bestDist = dist
+			best = ci
 		}
 	}
-	return idx, worst
+	return best
+}
+
+func nearestQuantCentroid(vec []uint8, centroids [][Dims]uint8) int {
+	best := 0
+	var bestDist uint32 = ^uint32(0)
+	for ci, c := range centroids {
+		var dist uint32
+		for d := 0; d < Dims; d++ {
+			ai, bi := vec[d], c[d]
+			if ai == SentinelU8 || bi == SentinelU8 {
+				continue
+			}
+			if ai >= bi {
+				dist += uint32(ai - bi)
+			} else {
+				dist += uint32(bi - ai)
+			}
+		}
+		if dist < bestDist {
+			bestDist = dist
+			best = ci
+		}
+	}
+	return best
+}
+
+func quantizeCentroids(centroids [][Dims]float32) [][Dims]uint8 {
+	out := make([][Dims]uint8, len(centroids))
+	for ci, c := range centroids {
+		for d := 0; d < Dims; d++ {
+			if c[d] < 0 {
+				out[ci][d] = SentinelU8
+			} else {
+				out[ci][d] = quantize(c[d])
+			}
+		}
+	}
+	return out
+}
+
+func assignParallel(data []uint8, n int, centroids [][Dims]uint8, assign []int32, nWorkers int) {
+	chunkSize := (n + nWorkers - 1) / nWorkers
+	var wg sync.WaitGroup
+	for w := 0; w < nWorkers; w++ {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		if start >= n {
+			break
+		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				off := i * Dims
+				assign[i] = int32(nearestQuantCentroid(data[off:off+Dims], centroids))
+			}
+		}(start, end)
+	}
+	wg.Wait()
+}
+
+func groupByCluster(assign []int32, n, k int) [][]int {
+	groups := make([][]int, k)
+	for i := 0; i < n; i++ {
+		c := int(assign[i])
+		if c >= 0 && c < k {
+			groups[c] = append(groups[c], i)
+		}
+	}
+	return groups
 }

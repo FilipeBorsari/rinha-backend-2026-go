@@ -1,15 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
+	"reflect"
 	"runtime"
 	"strconv"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/handler"
+	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/timing"
+	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/vectorize"
 	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/vectorstore"
 )
 
@@ -20,7 +24,6 @@ func getEnv(key, fallback string) string {
 
 	return fallback
 }
-// altos logs aqui ainda, para debug. LEMBRAR DE REMOVER ANTES DE ENTREGAR. --- IGNORE ---
 func setMaxProcsFromEnv() {
 	v := os.Getenv("GOMAXPROCS")
 	if v == "" {
@@ -38,6 +41,10 @@ func setMaxProcsFromEnv() {
 
 func main() {
 	setMaxProcsFromEnv()
+
+	if err := sonic.Pretouch(reflect.TypeOf(vectorize.Request{})); err != nil {
+		log.Printf("sonic.Pretouch falhou: %v", err)
+	}
 
 	refsPath := getEnv("REFERENCES_PATH", "/app/resources/references.json.gz")
 	mccPath := getEnv("MCC_RISK_PATH", "/app/resources/mcc_risk.json")
@@ -62,8 +69,17 @@ func main() {
 
 	h := handler.New(store, concurrency)
 
+	debugPort := getEnv("DEBUG_PORT", "6060")
 	go func() {
-		log.Println(http.ListenAndServe("0.0.0.0:6060", nil))
+		debugMux := http.NewServeMux()
+		debugMux.HandleFunc("GET /debug/timings", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(timing.Global.Snapshot())
+		})
+		log.Printf("debug server ouvindo na porta %s", debugPort)
+		if err := http.ListenAndServe(":"+debugPort, debugMux); err != nil {
+			log.Printf("debug server encerrado: %v", err)
+		}
 	}()
 
 	mux := http.NewServeMux()
@@ -73,8 +89,8 @@ func main() {
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 5 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

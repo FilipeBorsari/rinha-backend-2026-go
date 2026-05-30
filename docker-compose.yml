@@ -1,0 +1,70 @@
+services:
+
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+    networks:
+      - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.05"
+          memory: "20MB"
+
+  api-1:
+    build: .
+    image: filipeborsari/rinha-2026-go:latest
+    ports:
+      - "6060:6060"
+    environment:
+      PORT: "8080"
+      GOMAXPROCS: "1"
+      GOGC: "off"
+      GOMEMLIMIT: "155MiB"
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 360s
+    networks:
+      - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.475"
+          memory: "165MB"
+
+  api-2:
+    build: .
+    image: filipeborsari/rinha-2026-go:latest
+    environment:
+      PORT: "8080"
+      GOMAXPROCS: "1"
+      GOGC: "off"
+      GOMEMLIMIT: "155MiB"
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 360s
+    networks:
+      - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.47"
+          memory: "165MB"
+
+networks:
+  rinha:
+    driver: bridge

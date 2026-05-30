@@ -1,29 +1,20 @@
 package handler
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/timing"
 	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/vectorize"
 	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/vectorstore"
 )
 
-var fraudResponses = [6][]byte{
-	[]byte(`{"approved":true,"fraud_score":0.0}`),
-	[]byte(`{"approved":true,"fraud_score":0.2}`),
-	[]byte(`{"approved":true,"fraud_score":0.4}`),
-	[]byte(`{"approved":false,"fraud_score":0.6}`),
-	[]byte(`{"approved":false,"fraud_score":0.8}`),
-	[]byte(`{"approved":false,"fraud_score":1.0}`),
-}
-
 var bodyPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 4096)
-		return &b
-	},
+	New: func() any { b := make([]byte, 4096); return &b },
 }
 
 type Handler struct {
@@ -43,49 +34,48 @@ func (h *Handler) Ready(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) FraudScore(w http.ResponseWriter, r *http.Request) {
-	select {
-	case h.sem <- struct{}{}:
-		defer func() { <-h.sem }()
-	default:
-		w.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
-
-	if r.Context().Err() != nil {
-		return
-	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 
 	bufPtr := bodyPool.Get().(*[]byte)
 	buf := *bufPtr
-	n := 0
-	for n < len(buf) {
-		m, err := r.Body.Read(buf[n:])
-		n += m
-		if err != nil {
-			if err != io.EOF {
-				bodyPool.Put(bufPtr)
-				r.Body.Close()
-				http.Error(w, `{"error":"body error"}`, http.StatusBadRequest)
-				return
-			}
-			break
-		}
-	}
+	n, err := io.ReadFull(r.Body, buf)
 	r.Body.Close()
+	if err != nil && err != io.ErrUnexpectedEOF {
+		bodyPool.Put(bufPtr)
+		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+		return
+	}
 
 	var req vectorize.Request
-	if err := sonic.Unmarshal(buf[:n], &req); err != nil {
+	t0 := time.Now()
+	unmarshalErr := sonic.ConfigFastest.Unmarshal(buf[:n], &req)
+	timing.Global.ParseJSON.Record(time.Since(t0).Nanoseconds())
+	if unmarshalErr != nil {
 		bodyPool.Put(bufPtr)
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
-	bodyPool.Put(bufPtr)
 
+	t0 = time.Now()
 	query := vectorize.Vectorize(&req, h.store.Norm(), h.store.MccRisk())
-	result := h.store.Search(query)
+	timing.Global.Vectorize.Record(time.Since(t0).Nanoseconds())
+	bodyPool.Put(bufPtr) 
+
+	select {
+	case h.sem <- struct{}{}:
+		defer func() { <-h.sem }()
+	case <-r.Context().Done():
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	result := h.store.Score(query)
+
+	approved := "false"
+	if result.Approved {
+		approved = "true"
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(fraudResponses[result.FraudCount])
+	fmt.Fprintf(w, `{"approved":%s,"fraud_score":%.1f}`, approved, result.FraudScore)
 }
