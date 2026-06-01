@@ -1,44 +1,33 @@
 package vectorstore
 
-import (
-	"time"
 
-	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/timing"
-)
 
 const (
-	L1Count  = 256 // total L1 super-centroids
-	L2PerL1  = 256 // L2 sub-clusters per L1 super-centroid
-	L1Select = 12  // top-L1 super-centroids selected per query (was 8, prunes ~95% of the space)
-	L2Select = 64  // top-L2 sub-clusters selected per query (was 32, ~2,880 records examined)
+	L1Count  = 256
+	L2PerL1  = 256
+	L1Select = 12
+	L2Select = 64
 
 	fraudThreshold = 0.60
 )
 
-// KNNResult is returned by Score.
 type KNNResult struct {
 	FraudScore float32
 	FraudCount int
 	Approved   bool
 }
 
-// L2Cluster holds a quantised sub-cluster centroid and the contiguous
-// range [start, start+length) in the reordered data array.
 type L2Cluster struct {
 	centroid [Dims]uint8
 	start    int32
 	length   int32
 }
 
-// L1Cluster holds a quantised super-centroid and its L2PerL1 sub-clusters.
 type L1Cluster struct {
 	centroid [Dims]uint8
 	l2s      [L2PerL1]L2Cluster
 }
 
-// manhattanDist computes the Manhattan (L1) distance between two uint8 vectors.
-// Dimensions where either operand equals SentinelU8 are treated as missing and skipped.
-// The Go compiler auto-vectorises this loop when built with GOAMD64=v3 (AVX2).
 func manhattanDist(a, b []uint8) uint32 {
 	var sum uint32
 	for i := 0; i < Dims; i++ {
@@ -55,10 +44,6 @@ func manhattanDist(a, b []uint8) uint32 {
 	return sum
 }
 
-// squaredEuclideanDist computes the squared Euclidean (L2²) distance.
-// Used for the final exact K-NN scan to match the ground-truth labelling
-// which was generated with k=5 Euclidean brute-force.
-// Squared Euclidean preserves the same ordering as Euclidean without a sqrt.
 func squaredEuclideanDist(a, b []uint8) uint32 {
 	var sum uint32
 	for i := 0; i < Dims; i++ {
@@ -77,8 +62,6 @@ func squaredEuclideanDist(a, b []uint8) uint32 {
 	return sum
 }
 
-// scanL1 returns the L1Select indices of the closest L1 super-centroids to query.
-// Implements the L1 Root Scan: scans all L1Count centroids and prunes 97% of the space.
 func scanL1(query *[Dims]uint8, l1s []L1Cluster) [L1Select]int {
 	var topDist [L1Select]uint32
 	var topIdx [L1Select]int
@@ -102,15 +85,11 @@ func scanL1(query *[Dims]uint8, l1s []L1Cluster) [L1Select]int {
 	return topIdx
 }
 
-// l2Ref identifies one L2 sub-cluster by its L1 and L2 indices.
 type l2Ref struct {
 	l1 int
 	l2 int
 }
 
-// scanL2 scans all L2PerL1 sub-clusters of each selected L1 (2,048 candidates total)
-// and returns the L2Select closest sub-clusters.
-// Implements the L2 Leaf Scan.
 func scanL2(query *[Dims]uint8, l1s []L1Cluster, l1Idxs [L1Select]int) [L2Select]l2Ref {
 	var topDist [L2Select]uint32
 	var topRef [L2Select]l2Ref
@@ -185,8 +164,6 @@ func (h *topKHeap) fraudScore() float32 {
 }
 
 func (s *VectorStore) Score(query [Dims]float32) KNNResult {
-	t0 := time.Now()
-
 	var qv [Dims]uint8
 	for i, v := range query {
 		qv[i] = quantize(v)
@@ -206,8 +183,6 @@ func (s *VectorStore) Score(query [Dims]float32) KNNResult {
 			heap.push(d, s.labels[i])
 		}
 	}
-
-	timing.Global.Classify.Record(time.Since(t0).Nanoseconds())
 
 	score := heap.fraudScore()
 	return KNNResult{
