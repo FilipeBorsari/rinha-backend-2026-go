@@ -1,7 +1,6 @@
 package vectorstore
 
 import (
-	"fmt"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -10,8 +9,6 @@ import (
 func (s *VectorStore) buildIndex() {
 	n := s.n
 	data := s.data
-
-	fmt.Printf("vectorstore: building L1 index (%d centroids) over %d records\n", L1Count, n)
 
 	rng := rand.New(rand.NewSource(42))
 
@@ -25,8 +22,6 @@ func (s *VectorStore) buildIndex() {
 	}
 	assignParallel(data, n, l1Quant, l1Assign, nw)
 	l1Groups := groupByCluster(l1Assign, n, L1Count)
-
-	fmt.Printf("vectorstore: building L2 index (%d sub-clusters/L1) in parallel\n", L2PerL1)
 
 	type l2Result struct {
 		centroids [][Dims]uint8
@@ -72,8 +67,6 @@ func (s *VectorStore) buildIndex() {
 	}
 	wg.Wait()
 
-	fmt.Println("vectorstore: reordering records by cluster...")
-
 	s.l1s = make([]L1Cluster, L1Count)
 	newOrder := make([]int, 0, n)
 
@@ -102,9 +95,6 @@ func (s *VectorStore) buildIndex() {
 	}
 	s.data = newData
 	s.labels = newLabels
-
-	fmt.Printf("vectorstore: index ready — %d L1 × %d L2 = %d clusters\n",
-		L1Count, L2PerL1, L1Count*L2PerL1)
 }
 
 func kmeansMiniBatch(data []uint8, n, k, batchSize, iters int, rng *rand.Rand) [][Dims]float32 {

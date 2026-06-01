@@ -1,7 +1,5 @@
 package vectorstore
 
-
-
 const (
 	L1Count  = 256
 	L2PerL1  = 256

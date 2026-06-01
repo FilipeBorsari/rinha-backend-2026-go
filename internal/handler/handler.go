@@ -5,10 +5,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
-	"time"
-
 	"github.com/bytedance/sonic"
-	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/timing"
 	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/vectorize"
 	"github.com/filipeborsari/rinha-de-backend-2026-go/internal/vectorstore"
 )
@@ -47,18 +44,14 @@ func (h *Handler) FraudScore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req vectorize.Request
-	t0 := time.Now()
 	unmarshalErr := sonic.ConfigFastest.Unmarshal(buf[:n], &req)
-	timing.Global.ParseJSON.Record(time.Since(t0).Nanoseconds())
 	if unmarshalErr != nil {
 		bodyPool.Put(bufPtr)
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
 
-	t0 = time.Now()
 	query := vectorize.Vectorize(&req, h.store.Norm(), h.store.MccRisk())
-	timing.Global.Vectorize.Record(time.Since(t0).Nanoseconds())
 	bodyPool.Put(bufPtr) 
 
 	select {
