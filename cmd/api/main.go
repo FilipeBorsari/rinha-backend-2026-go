@@ -46,31 +46,24 @@ func main() {
 	normPath := getEnv("NORMALIZATION_PATH", "/app/resources/normalization.json")
 	port := getEnv("PORT", "8080")
 
-	concurrency := 100
-	if v := os.Getenv("CONCURRENCY"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			concurrency = n
-		}
-	}
-
 	store, err := vectorstore.Load(refsPath, mccPath, normPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	h := handler.New(store, concurrency)
+	h := handler.New(store)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ready", h.Ready)
 	mux.HandleFunc("POST /fraud-score", h.FraudScore)
 
 	srv := &http.Server{
-		Addr:         ":" + port,
-		Handler:      mux,
-		ReadTimeout:  2 * time.Second,
-		WriteTimeout: 5 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 2 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	if err := srv.ListenAndServe(); err != nil {
