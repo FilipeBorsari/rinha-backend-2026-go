@@ -1,0 +1,16 @@
+{
+  "participants": [
+    "Filipe Borsari"
+  ],
+  "social": [
+    "https://github.com/FilipeBorsari",
+    "https://www.linkedin.com/in/filipe-borsari-developer/"
+  ],
+  "source-code-repo": "https://github.com/FilipeBorsari/rinha-backend-2026-go",
+  "stack": [
+    "go",
+    "nginx",
+    "docker"
+  ],
+  "open_to_work": true
+}
