@@ -41,16 +41,19 @@ func main() {
 
 	_ = sonic.Pretouch(reflect.TypeOf(vectorize.Request{}))
 
-	refsPath := getEnv("REFERENCES_PATH", "/app/resources/references.json.gz")
+	snapshotPath := getEnv("REFERENCES_PATH", "/app/resources/references.bin")
+	refsPath := getEnv("REFERENCES_FALLBACK_PATH", "/app/resources/references.json.gz")
 	mccPath := getEnv("MCC_RISK_PATH", "/app/resources/mcc_risk.json")
 	normPath := getEnv("NORMALIZATION_PATH", "/app/resources/normalization.json")
 	port := getEnv("PORT", "8080")
 
-	store, err := vectorstore.Load(refsPath, mccPath, normPath)
+	store, err := vectorstore.Load(snapshotPath, refsPath, mccPath, normPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+
+	runtime.GC()
 
 	h := handler.New(store)
 
