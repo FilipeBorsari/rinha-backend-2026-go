@@ -3,14 +3,13 @@ package vectorstore
 import (
 	"compress/gzip"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 )
 
 const (
 	Dims = 14
-	K    = 5
+	K    = 11
 
 	SentinelU8 = 255
 	quantScale = 250.0
@@ -65,23 +64,7 @@ func dequantize(b uint8) float32 {
 	return float32(b) / quantScale
 }
 
-var ErrSnapshotInvalid = errors.New("invalid vectorstore snapshot")
-
-func Load(snapshotPath, refsPath, mccPath, normPath string) (*VectorStore, error) {
-	if snapshotPath != "" {
-		store, err := loadSnapshot(snapshotPath)
-		if err == nil {
-			return store, nil
-		}
-		if refsPath == "" || (!errors.Is(err, os.ErrNotExist) && !errors.Is(err, ErrSnapshotInvalid)) {
-			return nil, fmt.Errorf("snapshot: %w", err)
-		}
-	}
-
-	return Build(refsPath, mccPath, normPath)
-}
-
-func Build(refsPath, mccPath, normPath string) (*VectorStore, error) {
+func Load(refsPath, mccPath, normPath string) (*VectorStore, error) {
 	norm, err := loadNorm(normPath)
 	if err != nil {
 		return nil, fmt.Errorf("normalization: %w", err)
